@@ -5,8 +5,9 @@ Converts WeChat articles to cleanly formatted Markdown preserving:
 - Headings (#, ##, etc.)
 - Bold & emphasis styles (including WeChat inline font-weight styles)
 - Images with correct high-res URLs
-- Code blocks, blockquotes, and lists
+- Code blocks, blockquotes, lists, and tables
 - Date prefix (YYMMDD-Title.md) based on publication date or current date
+- Strips all tracking JS, stylesheets, and hidden DOM artifacts
 """
 
 import sys
@@ -19,6 +20,11 @@ from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
 
+VOID_ELEMENTS = {
+    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+    'link', 'meta', 'param', 'source', 'track', 'wbr', 'mp-style-type'
+}
+
 
 class WeChatArticleParser(HTMLParser):
     def __init__(self):
@@ -26,6 +32,9 @@ class WeChatArticleParser(HTMLParser):
         self.in_title = False
         self.in_author = False
         self.in_content = False
+        
+        self.ignore_depth = 0
+        self.content_depth = 0
         
         self.title_parts = []
         self.author_parts = []
@@ -40,12 +49,17 @@ class WeChatArticleParser(HTMLParser):
         self.in_blockquote = False
         self.list_stack = []  # ('ul' | 'ol', item_counter)
         self.current_img_index = 0
+        
+        # Table parsing
+        self.in_table = False
+        self.current_table = []
+        self.current_row = []
+        self.current_cell = []
 
     def is_bold_elem(self, tag, style):
         if tag in ('strong', 'b'):
             return True
         if style:
-            # Check font-weight
             s = style.lower().replace(' ', '')
             if 'font-weight:500' in s or 'font-weight:600' in s or 'font-weight:700' in s or 'font-weight:bold' in s:
                 return True
@@ -66,26 +80,43 @@ class WeChatArticleParser(HTMLParser):
         tag_id = attr_dict.get('id', '')
         tag_cls = attr_dict.get('class', '')
 
-        # Skip hidden elements
-        if 'display:none' in style.lower().replace(' ', '') or 'display: none' in style:
-            self.tag_stack.append((tag, attrs, False, False, True))
+        # Ignore scripts, styles, svgs, noscripts, and hidden elements
+        is_hidden = 'display:none' in style.lower().replace(' ', '') or 'display: none' in style
+        if tag in ('script', 'style', 'noscript', 'svg', 'iframe') or is_hidden:
+            self.ignore_depth += 1
             return
 
-        if tag_id == 'js_content' or 'rich_media_content' in tag_cls:
-            self.in_content = True
+        if self.ignore_depth > 0:
+            if tag not in VOID_ELEMENTS:
+                self.ignore_depth += 1
+            return
 
         if not self.in_content:
+            if tag_id == 'js_content' or 'rich_media_content' in tag_cls:
+                self.in_content = True
+                self.content_depth = 1
+                return
             if tag_id == 'activity-name' or 'rich_media_title' in tag_cls:
                 self.in_title = True
             elif tag_id == 'js_name' or 'rich_media_meta_nickname' in tag_cls:
                 self.in_author = True
-            self.tag_stack.append((tag, attrs, False, False, False))
             return
+
+        # Inside content
+        if tag not in VOID_ELEMENTS:
+            self.content_depth += 1
 
         is_bold = self.is_bold_elem(tag, style)
         is_italic = self.is_italic_elem(tag, style)
 
-        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+        if tag == 'table':
+            self.in_table = True
+            self.current_table = []
+        elif tag == 'tr' and self.in_table:
+            self.current_row = []
+        elif tag in ('td', 'th') and self.in_table:
+            self.current_cell = []
+        elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             self.heading_level = int(tag[1])
             self.content_parts.append('\n\n' + '#' * self.heading_level + ' ')
         elif tag == 'img':
@@ -94,7 +125,10 @@ class WeChatArticleParser(HTMLParser):
                 if 'wx_fmt=' in src and '#imgIndex=' not in src:
                     src += f'#imgIndex={self.current_img_index}'
                     self.current_img_index += 1
-                self.content_parts.append(f'\n\n![Image]({src})\n\n')
+                if not self.in_table:
+                    self.content_parts.append(f'\n\n![Image]({src})\n\n')
+                else:
+                    self.current_cell.append(f'![Image]({src})')
         elif tag == 'pre':
             self.in_pre = True
             self.content_parts.append('\n\n```\n')
@@ -121,26 +155,30 @@ class WeChatArticleParser(HTMLParser):
             else:
                 self.content_parts.append(f'\n{indent}- ')
         elif tag in ('p', 'section', 'div'):
-            if not self.heading_level and not self.in_pre:
+            if not self.heading_level and not self.in_pre and not self.in_table:
                 self.content_parts.append('\n\n')
 
         if is_bold and not self.heading_level:
             self.bold_stack += 1
-            self.content_parts.append('**')
+            if not self.in_table:
+                self.content_parts.append('**')
+            else:
+                self.current_cell.append('**')
 
         if is_italic and not self.heading_level:
             self.italic_stack += 1
-            self.content_parts.append('*')
+            if not self.in_table:
+                self.content_parts.append('*')
+            else:
+                self.current_cell.append('*')
 
-        self.tag_stack.append((tag, attrs, is_bold, is_italic, False))
+        if tag not in VOID_ELEMENTS:
+            self.tag_stack.append((tag, is_bold, is_italic))
 
     def handle_endtag(self, tag):
-        if not self.tag_stack:
-            return
-
-        last_tag, last_attrs, is_bold, is_italic, is_hidden = self.tag_stack.pop()
-
-        if is_hidden:
+        if self.ignore_depth > 0:
+            if tag not in VOID_ELEMENTS:
+                self.ignore_depth -= 1
             return
 
         if self.in_title and tag in ('h1', 'span', 'div'):
@@ -151,17 +189,38 @@ class WeChatArticleParser(HTMLParser):
         if not self.in_content:
             return
 
-        if is_italic and not self.heading_level:
-            if self.italic_stack > 0:
-                self.italic_stack -= 1
-                self.content_parts.append('*')
+        if tag not in VOID_ELEMENTS:
+            self.content_depth -= 1
+            if self.content_depth <= 0:
+                self.in_content = False
+                return
 
-        if is_bold and not self.heading_level:
-            if self.bold_stack > 0:
-                self.bold_stack -= 1
-                self.content_parts.append('**')
+        if self.tag_stack:
+            last_tag, is_bold, is_italic = self.tag_stack.pop()
+            if is_italic and not self.heading_level:
+                if self.italic_stack > 0:
+                    self.italic_stack -= 1
+                    if not self.in_table:
+                        self.content_parts.append('*')
+                    else:
+                        self.current_cell.append('*')
+            if is_bold and not self.heading_level:
+                if self.bold_stack > 0:
+                    self.bold_stack -= 1
+                    if not self.in_table:
+                        self.content_parts.append('**')
+                    else:
+                        self.current_cell.append('**')
 
-        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+        if tag == 'table':
+            self.in_table = False
+            self.render_table()
+        elif tag == 'tr' and self.in_table:
+            self.current_table.append(self.current_row)
+        elif tag in ('td', 'th') and self.in_table:
+            cell_text = ''.join(self.current_cell).strip().replace('\n', ' ')
+            self.current_row.append(cell_text)
+        elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             self.heading_level = 0
             self.content_parts.append('\n\n')
         elif tag == 'pre':
@@ -179,22 +238,45 @@ class WeChatArticleParser(HTMLParser):
                 self.list_stack.pop()
             self.content_parts.append('\n')
         elif tag in ('p', 'section', 'div'):
-            if not self.heading_level and not self.in_pre:
+            if not self.heading_level and not self.in_pre and not self.in_table:
                 self.content_parts.append('\n\n')
 
-        if (tag == 'div' and dict(last_attrs).get('id') == 'js_content') or 'rich_media_content' in dict(last_attrs).get('class', ''):
-            self.in_content = False
-
-    def handle_data(self, data):
-        if self.tag_stack and self.tag_stack[-1][4]:  # is_hidden
+    def render_table(self):
+        if not self.current_table:
+            return
+        
+        col_count = max(len(row) for row in self.current_table) if self.current_table else 0
+        if col_count == 0:
             return
 
+        # Pad rows
+        normalized = []
+        for row in self.current_table:
+            padded = row + [''] * (col_count - len(row))
+            normalized.append(padded)
+
+        table_lines = []
+        header = normalized[0]
+        table_lines.append('| ' + ' | '.join(header) + ' |')
+        table_lines.append('| ' + ' | '.join(['---'] * col_count) + ' |')
+
+        for row in normalized[1:]:
+            table_lines.append('| ' + ' | '.join(row) + ' |')
+
+        self.content_parts.append('\n\n' + '\n'.join(table_lines) + '\n\n')
+
+    def handle_data(self, data):
+        if self.ignore_depth > 0:
+            return
         if self.in_title:
             self.title_parts.append(data)
         elif self.in_author:
             self.author_parts.append(data)
         elif self.in_content:
-            self.content_parts.append(data)
+            if self.in_table:
+                self.current_cell.append(data)
+            else:
+                self.content_parts.append(data)
 
 
 def clean_markdown(raw_md):
@@ -267,7 +349,6 @@ def get_repo_root():
         if os.path.exists(os.path.join(cur, '.git')):
             return cur
         cur = os.path.dirname(cur)
-    # Fallback to 4 levels up from this script
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
@@ -283,7 +364,6 @@ def parse_and_save(url, output_dir=None):
 
     title = unescape(''.join(parser.title_parts)).strip()
     if not title:
-        # Fallback regex for title
         tm = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
         if tm:
             title = unescape(tm.group(1)).strip()
